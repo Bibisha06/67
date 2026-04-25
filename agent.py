@@ -1,18 +1,6 @@
 """
 agent.py — Automaton AI Infosystem Voice Agent
 ================================================
-Self-hosted inbound + outbound phone agent using LiveKit Agents.
-
-Tech stack:
-  STT  : Groq Whisper (whisper-large-v3) via OpenAI-compatible endpoint
-  LLM  : Groq llama-3.3-70b-versatile via OpenAI-compatible endpoint
-  TTS  : Sarvam AI REST API (custom LiveKit TTS plugin, chunked streaming)
-  VAD  : Silero
-  SIP  : Twilio (inbound + outbound via LiveKit SIP)
-  DB   : Airtable (call_logs + orders tables)
-
-Run locally:
-  python agent.py dev
 """
 
 from __future__ import annotations
@@ -23,6 +11,7 @@ import json
 import logging
 import os
 import uuid
+import re
 from datetime import datetime, timezone
 
 import aiohttp
@@ -47,83 +36,167 @@ from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
 from livekit.agents.utils import shortuuid
 
 # LiveKit plugins
-from livekit.plugins import openai as lk_openai   # Groq STT + LLM via OAI-compat
-from livekit.plugins import silero                 # VAD
+from livekit.plugins import openai as lk_openai
+from livekit.plugins import silero
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. ENVIRONMENT & CONFIGURATION
-# ──────────────────────────────────────────────────────────────────────────────
-load_dotenv()  # Reads from .env in current directory
+from menu import fuzzy_match_item
 
-# LiveKit
+load_dotenv()
+
 LIVEKIT_URL        = os.environ["LIVEKIT_URL"]
 LIVEKIT_API_KEY    = os.environ["LIVEKIT_API_KEY"]
 LIVEKIT_API_SECRET = os.environ["LIVEKIT_API_SECRET"]
 LIVEKIT_SIP_TRUNK  = os.environ["LIVEKIT_SIP_TRUNK_ID"]
 
-# Groq — one API key handles both Whisper STT and LLaMA LLM
 GROQ_API_KEY  = os.environ["GROQ_API_KEY"]
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
-# Sarvam AI TTS
 SARVAM_API_KEY = os.environ["SARVAM_API_KEY"]
 SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
 
-# Twilio
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN  = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_PHONE       = os.environ["TWILIO_PHONE_NUMBER"]
 
-# Airtable
 AIRTABLE_PAT     = os.environ["AIRTABLE_PAT"]
 AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
 AIRTABLE_API_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
 
-# Agent behaviour
 MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION_SECONDS", "300"))
-DEFAULT_PROMPT = (
-    "You are a polite and efficient order acceptance agent for Automaton AI Infosystem. "
-    "Your job is to accept customer orders over a phone call. "
-    "Always respond in the same language the customer is speaking. "
-    "Follow this exact flow: "
-    "1) Greet the customer warmly and ask for their name. "
-    "2) Ask what they would like to order. "
-    "3) Confirm the quantity. "
-    "4) Ask for their delivery address. "
-    "5) Read back the full order details and ask for confirmation. "
-    "6) Thank them and close the call. "
-    "Keep all responses short and conversational since this is a voice call. "
-    "Do not discuss anything unrelated to placing an order."
-)
-SYSTEM_PROMPT = os.getenv("AGENT_SYSTEM_PROMPT", DEFAULT_PROMPT)
 
 logger = logging.getLogger("voice-agent")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. LANGUAGE → SARVAM VOICE CODE MAPPING
-#
-#    To add a new language:
-#      - Add an entry below using the 2-letter ISO 639-1 code (e.g. "ta" for Tamil)
-#      - Use the Sarvam BCP-47 locale as value (e.g. "ta-IN")
-#    The key must match what Groq Whisper returns as detected_language (lowercased).
-# ──────────────────────────────────────────────────────────────────────────────
+# ── LANGUAGE CONFIG ────────────────────────────────────────────────────────────
+
 LANGUAGE_VOICE_MAP: dict[str, str] = {
-    "hi": "hi-IN",   # Hindi
-    "kn": "kn-IN",   # Kannada
-    "mr": "mr-IN",   # Marathi
-    "en": "en-IN",   # English (Indian accent)
+    "hi": "hi-IN",
+    "kn": "kn-IN",
+    "mr": "mr-IN",
+    "en": "en-IN",
 }
-DEFAULT_VOICE = "en-IN"  # Fallback before language is detected
+
+# Strict allowlist — ONLY these 4 are accepted. Anything else triggers the gate.
+SUPPORTED_LANGS = {"en", "hi", "kn", "mr"}
+
+# How many consecutive unsupported-language turns before we hang up
+MAX_LANG_RETRIES = 3
+
+# Single pre-built fallback line covering all 4 languages, played when Whisper
+# detects a language outside our supported set.
+UNSUPPORTED_LANG_PROMPT = (
+    "Sorry, we only support English, Hindi, Kannada, and Marathi. "
+    "Please speak in one of these languages. | "
+    "क्षमा करें, हम केवल अंग्रेज़ी, हिंदी, कन्नड़ और मराठी में सेवा देते हैं। "
+    "कृपया इनमें से किसी एक भाषा में बोलें। | "
+    "ಕ್ಷಮಿಸಿ, ನಾವು ಕೇವಲ ಇಂಗ್ಲಿಷ್, ಹಿಂದಿ, ಕನ್ನಡ ಮತ್ತು ಮರಾಠಿಯಲ್ಲಿ ಸೇವೆ ನೀಡುತ್ತೇವೆ. "
+    "ದಯವಿಟ್ಟು ಈ ಭಾಷೆಗಳಲ್ಲಿ ಒಂದರಲ್ಲಿ ಮಾತನಾಡಿ. | "
+    "माफ करा, आम्ही फक्त इंग्रजी, हिंदी, कन्नड आणि मराठीत सेवा देतो. "
+    "कृपया यापैकी एका भाषेत बोला."
+)
+
+UNSUPPORTED_LANG_GOODBYE = (
+    "Sorry, we are unable to continue as the spoken language is not supported. "
+    "We only accept English, Hindi, Kannada, and Marathi. Goodbye! | "
+    "क्षमा करें, हम आगे नहीं बढ़ सकते। केवल अंग्रेज़ी, हिंदी, कन्नड़ और मराठी स्वीकार्य हैं। धन्यवाद! | "
+    "ಕ್ಷಮಿಸಿ, ನಾವು ಮುಂದುವರಿಯಲು ಸಾಧ್ಯವಿಲ್ಲ. ಧನ್ಯವಾದ! | "
+    "माफ करा, आम्ही पुढे जाऊ शकत नाही. धन्यवाद!"
+)
+
+DEFAULT_VOICE = "en-IN"
+
+# ── RESPONSES & AUDIO CACHE ───────────────────────────────────────────────────
+
+with open("responses.json", "r", encoding="utf-8") as f:
+    RESPONSES = json.load(f)
+
+AUDIO_CACHE: dict[str, bytes] = {}
+
+_templates_str = json.dumps(RESPONSES, ensure_ascii=False, indent=2)
+
+DEFAULT_PROMPT = (
+    "You are a polite and efficient order acceptance agent for Automaton AI Infosystem. "
+    "Your job is to accept customer orders over a phone call. "
+    "CRITICAL: You MUST ONLY respond in English, Hindi, Kannada, or Marathi. "
+    "These are the ONLY four languages you are permitted to speak. "
+    "If the customer speaks in any other language, do NOT attempt to reply in that language. "
+    "Instead, play the unsupported language prompt and wait for them to switch. "
+    "Always respond in the exact same language the customer is currently speaking "
+    "(from the four supported languages only). "
+    "If the user gives multiple pieces of information at once, accept them naturally. "
+    "Follow this exact flow: "
+    "1) Greet the customer warmly and ask what they would like to order. "
+    "2) Collect any missing details: item name, quantity, and delivery address. "
+    "3) Read back the full order details and ask for confirmation. "
+    "4) Thank them and close the call. "
+    "\nCRITICAL INSTRUCTION FOR LOW LATENCY: "
+    "Whenever appropriate and natural, you MUST use one of the exact translated sentences "
+    "from the JSON object below verbatim, matching the user's language. "
+    "This allows us to use pre-generated audio caches:\n"
+    f"{_templates_str}\n"
+    "Only generate custom/dynamic text if the user says something complex that requires "
+    "a specific natural response. Keep it brief. Do not output JSON, just say the sentence."
+)
+SYSTEM_PROMPT = os.getenv("AGENT_SYSTEM_PROMPT", DEFAULT_PROMPT)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. AIRTABLE HELPERS
-#    All DB writes are fire-and-forget wrapped in try/except so a database
-#    failure can NEVER crash an ongoing call.
-# ──────────────────────────────────────────────────────────────────────────────
+# ── PREWARM ───────────────────────────────────────────────────────────────────
+
+async def prewarm_audio_cache(*args, **kwargs):
+    """Generates Sarvam TTS for all predefined responses and caches as PCM."""
+    logger.info("Pre-warming audio cache...")
+
+    headers = {
+        "api-subscription-key": SARVAM_API_KEY,
+        "Content-Type":         "application/json",
+    }
+
+    async def fetch_pcm(text: str, voice_code: str) -> bytes | None:
+        payload = {
+            "inputs":               [text],
+            "target_language_code": voice_code,
+            "speaker":              "anushka",
+            "model":                "bulbul:v2",
+            "enable_preprocessing": True,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(SARVAM_TTS_URL, headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("audios"):
+                        return base64.b64decode(data["audios"][0])[44:]  # strip WAV header
+        return None
+
+    # Pre-generate regular intents
+    for intent, variants in RESPONSES.items():
+        if isinstance(variants, dict):
+            for lang, text in variants.items():
+                if text not in AUDIO_CACHE:
+                    voice_code = LANGUAGE_VOICE_MAP.get(lang.lower(), DEFAULT_VOICE)
+                    pcm = await fetch_pcm(text, voice_code)
+                    if pcm:
+                        AUDIO_CACHE[text] = pcm
+
+    # Pre-generate language_not_detected fallback sequence
+    for text in RESPONSES.get("language_not_detected", {}).get("fallback_sequence", []):
+        if text not in AUDIO_CACHE:
+            pcm = await fetch_pcm(text, DEFAULT_VOICE)
+            if pcm:
+                AUDIO_CACHE[text] = pcm
+
+    # Pre-generate the strict unsupported-language prompts (en-IN voice reads the
+    # combined 4-language string — Sarvam handles multilingual mixed input)
+    for combined_text in (UNSUPPORTED_LANG_PROMPT, UNSUPPORTED_LANG_GOODBYE):
+        if combined_text not in AUDIO_CACHE:
+            pcm = await fetch_pcm(combined_text, DEFAULT_VOICE)
+            if pcm:
+                AUDIO_CACHE[combined_text] = pcm
+
+    logger.info("Audio cache pre-warmed with %d entries.", len(AUDIO_CACHE))
+
+
+# ── AIRTABLE HELPERS ──────────────────────────────────────────────────────────
 
 async def _airtable_post(table: str, fields: dict) -> None:
-    """HTTP POST a single record to an Airtable table."""
     url = f"{AIRTABLE_API_URL}/{table}"
     headers = {
         "Authorization": f"Bearer {AIRTABLE_PAT}",
@@ -138,14 +211,9 @@ async def _airtable_post(table: str, fields: dict) -> None:
 
 
 async def log_call_to_airtable(
-    *,
-    call_id: str,
-    caller_number: str,
-    duration_seconds: float,
-    transcript: str,
-    language_detected: str,
+    *, call_id: str, caller_number: str, duration_seconds: float,
+    transcript: str, language_detected: str,
 ) -> None:
-    """Write a completed call summary to the call_logs table."""
     try:
         await _airtable_post("call_logs", {
             "call_id":           call_id,
@@ -160,18 +228,9 @@ async def log_call_to_airtable(
 
 
 async def extract_and_log_order(*, call_id: str, transcript: str) -> None:
-    """
-    Send the call transcript to Groq LLaMA to extract structured order data,
-    then write the extracted fields to the orders table in Airtable.
-
-    The LLM is prompted to return ONLY a JSON object — no surrounding prose.
-    If extraction fails, we log the error without crashing anything.
-    """
     try:
         from openai import AsyncOpenAI
-
         groq = AsyncOpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
-
         extraction_prompt = (
             "Extract order information from this phone call transcript. "
             "Return ONLY a valid JSON object with these exact keys:\n"
@@ -180,20 +239,15 @@ async def extract_and_log_order(*, call_id: str, transcript: str) -> None:
             "If any field cannot be determined, use an empty string (or 0 for quantity).\n\n"
             f"TRANSCRIPT:\n{transcript}"
         )
-
         response = await groq.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": extraction_prompt}],
-            temperature=0,  # Deterministic — we want consistent extraction
+            temperature=0,
         )
-
         raw = response.choices[0].message.content.strip()
-
-        # Strip markdown code fences if the LLM wrapped the JSON
         if raw.startswith("```"):
             parts = raw.split("```")
             raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
-
         order = json.loads(raw)
 
         await _airtable_post("orders", {
@@ -205,33 +259,15 @@ async def extract_and_log_order(*, call_id: str, transcript: str) -> None:
             "order_status":     "confirmed",
             "created_at":       datetime.now(timezone.utc).isoformat(),
         })
-
     except Exception as exc:
         logger.error("Failed to extract/log order to Airtable: %s", exc)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. SARVAM AI CUSTOM TTS PLUGIN
-#
-#    LiveKit does not have a built-in Sarvam plugin, so we implement one by
-#    subclassing livekit.agents.tts.TTS and ChunkedStream.
-#
-#    Sarvam returns base64-encoded WAV audio (22050 Hz, mono) in a single REST
-#    response. After decoding, we strip the 44-byte WAV header and deliver the
-#    raw PCM to LiveKit via AudioEmitter so playback starts immediately.
-# ──────────────────────────────────────────────────────────────────────────────
+# ── SARVAM TTS PLUGIN ─────────────────────────────────────────────────────────
 
 class SarvamTTS(TTS):
-    """
-    Custom TTS plugin for Sarvam AI multilingual Indian voices.
-
-    Usage:
-        tts = SarvamTTS(api_key="...", voice="en-IN")
-        tts.update_voice("hi-IN")   # dynamically switch after language detection
-    """
-
-    SAMPLE_RATE  = 22050   # Sarvam returns 22050 Hz WAV
-    NUM_CHANNELS = 1       # Mono
+    SAMPLE_RATE  = 22050
+    NUM_CHANNELS = 1
 
     def __init__(self, *, api_key: str, voice: str = "en-IN") -> None:
         super().__init__(
@@ -240,13 +276,9 @@ class SarvamTTS(TTS):
             num_channels=self.NUM_CHANNELS,
         )
         self._api_key = api_key
-        self._voice   = voice   # BCP-47 locale, e.g. "hi-IN"
+        self._voice   = voice
 
     def update_voice(self, voice_code: str) -> None:
-        """
-        Dynamically switch the TTS voice.
-        Call this as soon as Groq Whisper has detected the caller's language.
-        """
         logger.info("Sarvam TTS: switching voice to '%s'", voice_code)
         self._voice = voice_code
 
@@ -256,36 +288,13 @@ class SarvamTTS(TTS):
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> "SarvamChunkedStream":
-        return SarvamChunkedStream(
-            tts=self,
-            input_text=text,
-            conn_options=conn_options,
-        )
+        return SarvamChunkedStream(tts=self, input_text=text, conn_options=conn_options)
 
 
 class SarvamChunkedStream(ChunkedStream):
-    """
-    Fetches one TTS response from Sarvam, decodes it, and pushes the raw PCM
-    bytes to LiveKit via AudioEmitter. LiveKit starts playing as soon as the
-    first (and in this case only) chunk arrives.
-    """
-
     async def _run(self, output_emitter) -> None:  # type: ignore[override]
         tts: SarvamTTS = self._tts  # type: ignore[assignment]
 
-        payload = {
-            "inputs":               [self._input_text],
-            "target_language_code": tts._voice,
-            "speaker":              "anushka",    # Use 'anushka' (available in bulbul:v2)
-            "model":                "bulbul:v2",
-            "enable_preprocessing": True,
-        }
-        headers = {
-            "api-subscription-key": tts._api_key,
-            "Content-Type":         "application/json",
-        }
-
-        # Initialize the emitter with Sarvam's audio properties
         output_emitter.initialize(
             request_id   = shortuuid(),
             sample_rate  = tts.sample_rate,
@@ -294,190 +303,231 @@ class SarvamChunkedStream(ChunkedStream):
             stream       = False,
         )
 
+        # Serve from cache if available (zero latency)
+        if self._input_text in AUDIO_CACHE:
+            output_emitter.push(AUDIO_CACHE[self._input_text])
+            output_emitter.flush()
+            return
+
+        payload = {
+            "inputs":               [self._input_text],
+            "target_language_code": tts._voice,
+            "speaker":              "anushka",
+            "model":                "bulbul:v2",
+            "enable_preprocessing": True,
+        }
+        headers = {
+            "api-subscription-key": tts._api_key,
+            "Content-Type":         "application/json",
+        }
+
         async with aiohttp.ClientSession() as session:
             async with session.post(SARVAM_TTS_URL, headers=headers, json=payload) as resp:
                 if resp.status != 200:
-                    body = await resp.text()
-                    logger.error("Sarvam TTS error %d: %s", resp.status, body)
                     return
                 data = await resp.json()
-                logger.debug("Sarvam TTS raw response: %s", data)
 
         if not data.get("audios"):
-            logger.error("Sarvam TTS returned no audios field")
             return
-
-        # Sarvam returns a list of base64-encoded WAV audios
         audio_bytes = base64.b64decode(data["audios"][0])
-        logger.debug("Decoded audio length: %d bytes", len(audio_bytes))
-
         if len(audio_bytes) < 45:
-            logger.error("Sarvam TTS returned an empty or too-short audio file")
             return
+        pcm_bytes = audio_bytes[44:]
 
-        pcm_bytes   = audio_bytes[44:] # Strip WAV header
+        # Store in cache for future calls
+        AUDIO_CACHE[self._input_text] = pcm_bytes
 
-        # Push to LiveKit (SDK handles end_input and join automatically)
         output_emitter.push(pcm_bytes)
         output_emitter.flush()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. GROQ STT — Whisper via OpenAI-compatible endpoint
-#    language=None tells Whisper to auto-detect the caller's language.
-# ──────────────────────────────────────────────────────────────────────────────
+# ── STT & VAD ─────────────────────────────────────────────────────────────────
 
 def build_groq_stt() -> lk_openai.STT:
     return lk_openai.STT(
         model    = "whisper-large-v3",
-        language = "",          # Auto-detect via empty string (None causes crash in 1.5.6)
+        language = "",           # auto-detect; we enforce the allowlist ourselves
         api_key  = GROQ_API_KEY,
         base_url = GROQ_BASE_URL,
     )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 6. GROQ LLM — llama-3.3-70b via OpenAI-compatible endpoint
-#    Streaming is enabled by default in lk_openai.LLM so tokens flow to TTS
-#    immediately without waiting for the full response.
-# ──────────────────────────────────────────────────────────────────────────────
-
-def build_groq_llm() -> lk_openai.LLM:
-    return lk_openai.LLM(
-        model    = "llama-3.3-70b-versatile",
-        api_key  = GROQ_API_KEY,
-        base_url = GROQ_BASE_URL,
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 7. SILERO VAD — Voice Activity Detection tuning
-#
-#   ┌─────────────────────────────────────────────────────────┐
-#   │ Parameter guide — adjust to match your audio quality:  │
-#   │                                                         │
-#   │ min_silence_duration_ms                                 │
-#   │   How long silence must persist before the caller is    │
-#   │   considered to have finished speaking.                 │
-#   │   • Lower (e.g. 300ms) → faster response but may clip  │
-#   │     slow speakers or sentences with natural pauses.     │
-#   │   • Higher (e.g. 600ms) → more patient but may feel    │
-#   │     sluggish.  400ms is a solid default.                │
-#   │                                                         │
-#   │ speech_pad_ms                                           │
-#   │   Extra audio appended to the end of each speech        │
-#   │   segment to avoid clipping the last phoneme.           │
-#   │   200ms works well for most cases.                      │
-#   │                                                         │
-#   │ threshold (uncomment to tune)                           │
-#   │   0–1 probability score that triggers speech detection. │
-#   │   0.5 is balanced; raise to 0.7 in noisy environments  │
-#   │   to reduce false positives (music, background chatter).│
-#   │                                                         │
-#   │ min_speech_duration_ms (uncomment to tune)              │
-#   │   Ignore speech bursts shorter than this value.         │
-#   │   Useful to filter out coughs, chair creaks, etc.       │
-#   └─────────────────────────────────────────────────────────┘
-# ──────────────────────────────────────────────────────────────────────────────
 
 def build_silero_vad() -> silero.VAD:
     return silero.VAD.load(
-        min_silence_duration    = 0.4,   # Wait 0.4s of silence before endpoint
-        prefix_padding_duration = 0.2,   # Buffer 0.2s before/after speech ends
+        min_silence_duration    = 0.5,
+        prefix_padding_duration = 0.1,
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 8. ORDER AGENT
-#    Subclasses livekit.agents.Agent to hook into conversation events.
-#    Tracks the full transcript and detected language for post-call logging.
-# ──────────────────────────────────────────────────────────────────────────────
+# ── ORDER AGENT ───────────────────────────────────────────────────────────────
 
 class OrderAgent(Agent):
-    """LiveKit Agent that manages one phone call, logs everything to Airtable."""
-
     def __init__(self, *, call_id: str, caller_number: str, tts_plugin: SarvamTTS) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
-        self.call_id       = call_id
-        self.caller_number = caller_number
-        self._tts_plugin   = tts_plugin
-        self._start_time   = asyncio.get_event_loop().time()
+        self.call_id        = call_id
+        self.caller_number  = caller_number
+        self._tts_plugin    = tts_plugin
+        self._start_time    = asyncio.get_event_loop().time()
         self._transcript_lines: list[str] = []
-        self._detected_lang = "en"   # Default; will be updated on first STT event
+        self._detected_lang = "en"
 
-    # ── Hook: called each time the caller finishes speaking ──────────────────
+        # Strict language gate state
+        self._lang_retry_count = 0          # consecutive turns in an unsupported language
+        self._lang_gate_active = False      # True once the gate fires; prevents LLM call
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def get_response(self, intent: str) -> str:
+        variants = RESPONSES.get(intent)
+        if isinstance(variants, dict):
+            return variants.get(self._detected_lang, variants.get("en", ""))
+        return ""
+
+    def _derive_lang(self, text: str) -> str | None:
+        """
+        Keyword / script-based language override.
+        Returns a 2-char lang code or None if nothing matches.
+        """
+        text_lower = text.lower()
+
+        # Kannada — Unicode block U+0C80–U+0CFF or common romanised words
+        if re.search(r'[\u0C80-\u0CFF]', text) or re.search(
+            r'\b(namaskara|beku|kodi|illa|houdu|yenu|nanna|nimage)\b', text_lower
+        ):
+            return "kn"
+
+        # Marathi — Devanagari markers distinct from Hindi
+        if re.search(r'\b(आहे|मला|तुम्हाला|काय|पाहिजे|होय|द्या|करतो)\b', text) or re.search(
+            r'\b(ahe|mala|tumhala|pahije|dya)\b', text_lower
+        ):
+            return "mr"
+
+        # Hindi
+        if re.search(r'\b(है|मुझे|आपको|क्या|चाहिए)\b', text) or re.search(
+            r'\b(hai|mujhe|aapko|chahiye)\b', text_lower
+        ):
+            return "hi"
+
+        return None
+
+    # ── turn handler ──────────────────────────────────────────────────────────
+
     async def on_user_turn_completed(self, chat_ctx, new_message) -> None:  # type: ignore[override]
-        # Capture caller's words
-        text = getattr(new_message, "text_content", None) or ""
+        text       = (getattr(new_message, "text_content", None) or "").strip()
+        text_lower = text.lower()
+
+        # ── 1. Resolve language ───────────────────────────────────────────────
+        derived_lang = self._derive_lang(text)
+        base_lang    = getattr(new_message, "detected_language", None)
+        whisper_lang = base_lang[:2].lower() if base_lang else None
+
+        # Keyword override wins; otherwise trust Whisper
+        lang = derived_lang or whisper_lang
+
+        # ── 2. STRICT LANGUAGE GATE ──────────────────────────────────────────
+        #
+        # If Whisper (or the script detector) gives us a language that is NOT
+        # in our supported set, we refuse to pass the turn to the LLM.
+        #
+        if lang and lang not in SUPPORTED_LANGS:
+            self._lang_retry_count += 1
+            self._lang_gate_active  = True
+
+            logger.warning(
+                "Unsupported language '%s' detected (attempt %d/%d). Blocking LLM.",
+                lang, self._lang_retry_count, MAX_LANG_RETRIES,
+            )
+
+            if self._lang_retry_count >= MAX_LANG_RETRIES:
+                # Three strikes — hang up
+                logger.warning("Max unsupported-language retries reached. Hanging up.")
+                self._transcript_lines.append(f"[SYSTEM: unsupported language '{lang}', call terminated]")
+                if self._session is not None:
+                    await self._session.say(UNSUPPORTED_LANG_GOODBYE, allow_interruptions=False)
+                asyncio.create_task(self.disconnect_after_delay(delay=3))
+            else:
+                # Ask them to switch — play the 4-language combined prompt
+                self._transcript_lines.append(f"[SYSTEM: unsupported language '{lang}', retry {self._lang_retry_count}]")
+                if self._session is not None:
+                    await self._session.say(UNSUPPORTED_LANG_PROMPT, allow_interruptions=True)
+
+            # Do NOT call super() — the LLM must never see this turn
+            return
+
+        # ── 3. Valid language turn — reset the gate ───────────────────────────
+        self._lang_retry_count = 0
+        self._lang_gate_active = False
+
+        # Switch voice if the language changed (only on substantial utterances
+        # or when a keyword override is confident)
+        is_substantial = len(text.split()) >= 3
+        if lang and (derived_lang or is_substantial or self._detected_lang == "en"):
+            if lang != self._detected_lang:
+                self._detected_lang = lang
+                voice_code = LANGUAGE_VOICE_MAP[lang]
+                self._tts_plugin.update_voice(voice_code)
+                logger.info("Switched detected language to '%s', voice to '%s'.", lang, voice_code)
+
+        # ── 4. Normal flow ────────────────────────────────────────────────────
         if text:
             self._transcript_lines.append(f"Caller: {text}")
+            await super().on_user_turn_completed(chat_ctx, new_message)
+        else:
+            # Nothing heard — play the no-speech template for the current language
+            if self._session is not None:
+                resp_text = self.get_response("no_speech_detected")
+                self._transcript_lines.append(f"Agent: {resp_text}")
+                await self._session.say(resp_text, allow_interruptions=True)
 
-        # Detect language from the Whisper metadata if available
-        lang = getattr(new_message, "detected_language", None)
-        if lang:
-            lang_code = lang[:2].lower()   # "hi-IN" → "hi"
-            if lang_code != self._detected_lang:
-                self._detected_lang = lang_code
-                voice_code = LANGUAGE_VOICE_MAP.get(lang_code, DEFAULT_VOICE)
-                self._tts_plugin.update_voice(voice_code)
-                logger.info("Language switched: %s → voice %s", lang_code, voice_code)
+    # ── assistant turn ────────────────────────────────────────────────────────
 
-        await super().on_user_turn_completed(chat_ctx, new_message)
-
-    # ── Hook: called each time the agent finishes speaking ───────────────────
     async def on_assistant_turn_completed(self, chat_ctx, new_message) -> None:  # type: ignore[override]
-        text = getattr(new_message, "text_content", None) or ""
+        text = (getattr(new_message, "text_content", None) or "").strip()
         if text:
             self._transcript_lines.append(f"Agent: {text}")
+            if "successfully" in text.lower() or "धन्यवाद" in text:
+                asyncio.create_task(self.disconnect_after_delay())
         await super().on_assistant_turn_completed(chat_ctx, new_message)
 
-    # ── Post-call: log to Airtable ────────────────────────────────────────────
+    # ── utilities ─────────────────────────────────────────────────────────────
+
+    async def disconnect_after_delay(self, delay: float = 2.0) -> None:
+        await asyncio.sleep(delay)
+        if self._session and self._session.room:
+            await self._session.room.disconnect()
+
     async def finalize_call(self) -> None:
         duration   = asyncio.get_event_loop().time() - self._start_time
         transcript = "\n".join(self._transcript_lines)
         voice_code = LANGUAGE_VOICE_MAP.get(self._detected_lang, DEFAULT_VOICE)
 
-        logger.info("Finalizing call %s. Duration: %.1f s", self.call_id, duration)
-
-        # Run both Airtable writes concurrently; errors in either are swallowed
+        logger.info("Finalizing call %s.", self.call_id)
         await asyncio.gather(
             log_call_to_airtable(
-                call_id          = self.call_id,
-                caller_number    = self.caller_number,
-                duration_seconds = duration,
-                transcript       = transcript,
-                language_detected= voice_code,
+                call_id=self.call_id,
+                caller_number=self.caller_number,
+                duration_seconds=duration,
+                transcript=transcript,
+                language_detected=voice_code,
             ),
-            extract_and_log_order(
-                call_id    = self.call_id,
-                transcript = transcript,
-            ),
+            extract_and_log_order(call_id=self.call_id, transcript=transcript),
             return_exceptions=True,
         )
         logger.info("Call %s finalized.", self.call_id)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 9. AGENT ENTRYPOINT
-#    LiveKit calls this for every new room — both inbound SIP calls AND rooms
-#    created by call_customer() for outbound dialing.
-# ──────────────────────────────────────────────────────────────────────────────
+# ── ENTRYPOINT ────────────────────────────────────────────────────────────────
 
 async def entrypoint(ctx: JobContext) -> None:
-    """
-    Bootstraps the full STT → LLM → TTS pipeline for one phone call session.
-    Automatically handles both inbound and outbound calls because both create
-    a LiveKit room that triggers this entrypoint.
-    """
     call_id       = str(uuid.uuid4())
-    # Room metadata carries the caller phone number when set by the SIP gateway
     caller_number = ctx.room.metadata or "unknown"
-    logger.info("New call: call_id=%s  caller=%s", call_id, caller_number)
 
-    # Build pipeline components
     vad_plugin = build_silero_vad()
     stt_plugin = build_groq_stt()
-    llm_plugin = build_groq_llm()
+    llm_plugin = lk_openai.LLM(
+        model    = "llama-3.3-70b-versatile",
+        api_key  = GROQ_API_KEY,
+        base_url = GROQ_BASE_URL,
+    )
     tts_plugin = SarvamTTS(api_key=SARVAM_API_KEY, voice=DEFAULT_VOICE)
 
     agent = OrderAgent(
@@ -488,33 +538,22 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await ctx.connect()
 
-    # ── AgentSession wires the STT → LLM → TTS pipeline together ─────────────
     session = AgentSession(
         stt = stt_plugin,
         llm = llm_plugin,
         tts = tts_plugin,
         vad = vad_plugin,
         turn_handling = TurnHandlingOptions(
-            interruption = InterruptionOptions(
-                enabled = True,
-                min_duration = 0.5,
-            ),
-            endpointing = EndpointingOptions(
-                min_delay = 0.5,
-            )
-        )
+            interruption = InterruptionOptions(enabled=True, min_duration=0.5),
+            endpointing  = EndpointingOptions(min_delay=0.5),
+        ),
     )
 
-    # ── Cost guard: auto-disconnect after MAX_CALL_DURATION seconds ───────────
     async def _enforce_max_duration() -> None:
         await asyncio.sleep(MAX_CALL_DURATION)
-        logger.warning("Max call duration (%d s) reached. Disconnecting.", MAX_CALL_DURATION)
         try:
-            await session.say(
-                "I'm sorry, we've reached the maximum call duration. "
-                "Thank you for calling Automaton AI. Goodbye!",
-                allow_interruptions=False,
-            )
+            if session.room.connection_state != rtc.ConnectionState.CONN_DISCONNECTED:
+                await session.say("I'm sorry, max duration reached. Goodbye!", allow_interruptions=False)
         finally:
             await ctx.room.disconnect()
 
@@ -522,64 +561,30 @@ async def entrypoint(ctx: JobContext) -> None:
 
     try:
         await session.start(
-            room              = ctx.room,
-            agent             = agent,
-            room_input_options= RoomInputOptions(),
+            room             = ctx.room,
+            agent            = agent,
+            room_input_options = RoomInputOptions(),
         )
-        # Trigger the initial greeting based on the system prompt
         await session.generate_reply(
-            instructions="Greet the customer warmly and begin collecting their order."
+            instructions=(
+                "Emit exactly 'Hello! Welcome to our store. What would you like to order today?' "
+                "to match the cached greeting."
+            )
         )
-        # Block until room disconnects (call ends)
         while ctx.room.connection_state != rtc.ConnectionState.CONN_DISCONNECTED:
             await asyncio.sleep(1)
     finally:
-        # Always save call data — even if an exception occurred mid-call
         await agent.finalize_call()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 10. OUTBOUND CALL HELPER
-#     Creates a dedicated LiveKit room and instructs Twilio (via LiveKit SIP)
-#     to dial the customer. The same entrypoint() function above handles
-#     the actual conversation once the customer picks up.
-# ──────────────────────────────────────────────────────────────────────────────
+# ── OUTBOUND CALL HELPER ──────────────────────────────────────────────────────
 
 async def call_customer(phone_number: str) -> str:
-    """
-    Dial a customer via Twilio PSTN.
-
-    Args:
-        phone_number: E.164 formatted number, e.g. "+919876543210"
-
-    Returns:
-        The LiveKit room name created for this call.
-
-    Example:
-        import asyncio
-        from agent import call_customer
-        asyncio.run(call_customer("+919876543210"))
-    """
     room_name = f"outbound-{uuid.uuid4()}"
-    sip_url   = f"sip:{phone_number}@pstn.twilio.com"
-
-    # For API calls, we need the https:// version of the URL
-    api_url = LIVEKIT_URL.replace("wss://", "https://").replace("ws://", "http://")
-
-    lk_client = lk_api.LiveKitAPI(
-        url        = api_url,
-        api_key    = LIVEKIT_API_KEY,
-        api_secret = LIVEKIT_API_SECRET,
-    )
-
+    api_url   = LIVEKIT_URL.replace("wss://", "https://").replace("ws://", "http://")
+    lk_client = lk_api.LiveKitAPI(url=api_url, api_key=LIVEKIT_API_KEY, api_secret=LIVEKIT_API_SECRET)
     try:
-        # 1. Create the room first so the agent can be dispatched into it
-        await lk_client.room.create_room(
-            lk_api.CreateRoomRequest(name=room_name)
-        )
-        logger.info("Created outbound room: %s", room_name)
-
-        # 2. Tell LiveKit's SIP to dial the customer via the Twilio trunk
+        await lk_client.room.create_room(lk_api.CreateRoomRequest(name=room_name))
         await lk_client.sip.create_sip_participant(
             lk_api.CreateSIPParticipantRequest(
                 sip_trunk_id         = LIVEKIT_SIP_TRUNK,
@@ -588,25 +593,17 @@ async def call_customer(phone_number: str) -> str:
                 room_name            = room_name,
                 participant_identity = f"customer-{phone_number}",
                 participant_name     = "Customer",
-                # Uncomment below to send DTMF tones after answer (e.g. to skip IVR menus)
-                # dtmf_digits        = "1",
             )
         )
-        logger.info("Outbound SIP call dispatched → %s (room: %s)", phone_number, room_name)
-
     finally:
         await lk_client.aclose()
-
     return room_name
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 11. MAIN — Start the LiveKit Worker
-# ──────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     cli.run_app(
-        WorkerOptions(entrypoint_fnc=entrypoint)
-        # LiveKit SDK reads LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
-        # automatically from environment variables.
+        WorkerOptions(
+            entrypoint_fnc = entrypoint,
+            prewarm_fnc    = prewarm_audio_cache,
+        )
     )
