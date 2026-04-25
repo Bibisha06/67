@@ -35,6 +35,36 @@
     "kn": "ನಿಮ್ಮ ಆರ್ಡರ್ ಯಶಸ್ವಿಯಾಗಿ ದಾಖಲಾಗಿದೆ. ಧನ್ಯವಾದ!",
     "mr": "तुमची ऑर्डर यशस्वीपणे नोंदवली गेली आहे. धन्यवाद!"
   },
+  "anything_else": {
+    "en": "Would you like anything else?",
+    "hi": "क्या आपको कुछ और चाहिए?",
+    "kn": "ನಿಮಗೆ ಇನ್ನೇನಾದರೂ ಬೇಕೇ?",
+    "mr": "तुम्हाला आणखी काही हवे का?"
+  },
+  "one_moment": {
+    "en": "One moment please.",
+    "hi": "एक पल रुकिए।",
+    "kn": "ಒಂದು ಕ್ಷಣ ದಯವಿಟ್ಟು.",
+    "mr": "एक क्षण थांबा."
+  },
+  "thank_you": {
+    "en": "Thank you for your order! Have a great day!",
+    "hi": "आपके ऑर्डर के लिए धन्यवाद! आपका दिन शुभ हो!",
+    "kn": "ನಿಮ್ಮ ಆರ್ಡರ್‌ಗೆ ಧನ್ಯವಾದ! ಶುಭ ದಿನ!",
+    "mr": "तुमच्या ऑर्डरसाठी धन्यवाद! शुभ दिवस!"
+  },
+  "item_not_available": {
+    "en": "Sorry, we don't have that item. Would you like something else?",
+    "hi": "माफ करें, यह आइटम उपलब्ध नहीं है। क्या आप कुछ और लेना चाहेंगे?",
+    "kn": "ಕ್ಷಮಿಸಿ, ಆ ವಸ್ತು ಲಭ್ಯವಿಲ್ಲ. ಬೇರೆ ಏನಾದರೂ ಬೇಕೇ?",
+    "mr": "माफ करा, ती वस्तू उपलब्ध नाही. आणखी काही हवे का?"
+  },
+  "ask_name": {
+    "en": "May I have your name please?",
+    "hi": "कृपया अपना नाम बताएं।",
+    "kn": "ದಯವಿಟ್ಟು ನಿಮ್ಮ ಹೆಸರು ಹೇಳಿ.",
+    "mr": "कृपया तुमचे नाव सांगा."
+  },
   "language_not_detected": {
     "fallback_sequence": [
       "Sorry, could you please speak in English, Hindi, Kannada, or Marathi?",

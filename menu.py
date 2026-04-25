@@ -1,3 +1,11 @@
+"""
+menu.py — Product catalogue + optimized fuzzy matching.
+
+Uses a fast two-pass approach:
+  1. Exact substring match (sorted longest-first to prefer specific aliases)
+  2. Character-set overlap for Whisper mishearings (very fast, no SequenceMatcher)
+"""
+
 MENU = {
     "items": [
         {"id": "S01", "name": "Ballpoint Pen",      "aliases": ["pen", "ball pen", "बॉलपेन", "पेन", "ಬಾಲ್ ಪೆನ್", "ಪೆನ್", "बॉलपेन", "पेन"],                          "price": 10},
@@ -23,12 +31,78 @@ MENU = {
     ]
 }
 
+# ── Pre-built index: sorted longest-first so specific aliases win ─────────
+_ALIAS_INDEX: list[tuple[str, dict]] = []
+for _item in MENU["items"]:
+    _ALIAS_INDEX.append((_item["name"].lower(), _item))
+    for _alias in _item.get("aliases", []):
+        _ALIAS_INDEX.append((_alias.lower(), _item))
+_ALIAS_INDEX.sort(key=lambda x: len(x[0]), reverse=True)
+
+# Only aliases >= 4 chars participate in fuzzy matching (avoid "pen", "gum" etc.)
+_FUZZY_ALIASES: list[tuple[str, set, dict]] = []
+for _alias_str, _item in _ALIAS_INDEX:
+    if len(_alias_str) >= 4:
+        _FUZZY_ALIASES.append((_alias_str, set(_alias_str), _item))
+
+_FUZZY_THRESHOLD = 0.70  # character overlap ratio
+
+
+def _char_overlap(a: str, b_set: set, b_len: int) -> float:
+    """Fast character-level overlap ratio. O(len(a))."""
+    if not a or b_len == 0:
+        return 0.0
+    common = sum(1 for c in a if c in b_set)
+    return (2.0 * common) / (len(a) + b_len)
+
+
 def fuzzy_match_item(spoken_text: str) -> dict | None:
+    """
+    Two-pass matching:
+      1. Exact substring match (fast path).
+      2. Character-overlap fuzzy match for Whisper mishearings.
+    """
     spoken_lower = spoken_text.lower()
-    for item in MENU["items"]:
-        if item["name"].lower() in spoken_lower:
+
+    # ── Pass 1: exact substring (longest alias first) ─────────────────────
+    for alias, item in _ALIAS_INDEX:
+        if alias in spoken_lower:
             return item
-        for alias in item.get("aliases", []):
-            if alias.lower() in spoken_lower:
-                return item
-    return None
+
+    # ── Pass 2: character overlap on words & bigrams ──────────────────────
+    words = spoken_lower.split()
+    candidates: list[str] = [w for w in words if len(w) >= 4]
+    for i in range(len(words) - 1):
+        bigram = f"{words[i]} {words[i+1]}"
+        if len(bigram) >= 4:
+            candidates.append(bigram)
+
+    if not candidates:
+        return None
+
+    best_score = 0.0
+    best_item = None
+
+    for candidate in candidates:
+        cand_len = len(candidate)
+        for alias_str, alias_set, item in _FUZZY_ALIASES:
+            alias_len = len(alias_str)
+            # Length guard: skip if vastly different sizes
+            if abs(cand_len - alias_len) > max(cand_len, alias_len) * 0.5:
+                continue
+            score = _char_overlap(candidate, alias_set, alias_len)
+            if score > best_score and score >= _FUZZY_THRESHOLD:
+                best_score = score
+                best_item = item
+                if score >= 0.95:
+                    return best_item
+
+    return best_item
+
+
+def get_menu_summary() -> str:
+    """Returns a formatted catalogue string for the LLM system prompt."""
+    lines = []
+    for item in MENU["items"]:
+        lines.append(f"• {item['name']} — ₹{item['price']}")
+    return "\n".join(lines)
