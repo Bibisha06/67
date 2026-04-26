@@ -1,4 +1,4 @@
-# Automaton AI Infosystem — Voice Agent
+# AI Voice Agent
 
 Self-hosted inbound + outbound phone agent using LiveKit Agents.  
 Speaks to customers in **English, Hindi, Kannada, and Marathi**,  
