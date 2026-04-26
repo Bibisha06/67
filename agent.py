@@ -465,10 +465,10 @@ def build_groq_stt(language_hint: str = "", prompt: str = "") -> lk_openai.STT:
     """
     if not prompt:
         prompt = (
-            "Hello, I need to place an order. "
-            "नमस्ते, मुझे नोटबुक चाहिए। "
+            "Hello, I need to place an order for pens. "
+            "नमस्ते, मुझे नोटबुक और पेन चाहिए। "
             "नमस्कार, मला पेन आणि वह्या पाहिजेत. "
-            "ನಮಸ್ಕಾರ, ನಾನು ಆರ್ಡರ್ ಮಾಡಬೇಕು. ನನಗೆ ಪೆನ್, ಪುಸ್ತಕ, ಸ್ಕೇಲ್ ಮತ್ತು ರಬ್ಬರ್ ಬೇಕು."
+            "ನಮಸ್ಕಾರ, ನಾನು ಆರ್ಡರ್ ಮಾಡಬೇಕು. ನನಗೆ ಪೆನ್ ಬೇಕು."
         )
     kwargs: dict = {
         "model":    "whisper-large-v3",
@@ -762,12 +762,9 @@ async def entrypoint(ctx: JobContext) -> None:
             agent              = agent,
             room_input_options = RoomInputOptions(),
         )
-        await session.generate_reply(
-            instructions=(
-                "Greet with exactly: "
-                "'Hello! Welcome to our store. What would you like to order today?' "
-                "Use the cached audio phrase verbatim."
-            )
+        await session.say(
+            "Hello! Welcome to our store. What would you like to order today?",
+            allow_interruptions=True
         )
         while ctx.room.connection_state != rtc.ConnectionState.CONN_DISCONNECTED:
             await asyncio.sleep(1)
